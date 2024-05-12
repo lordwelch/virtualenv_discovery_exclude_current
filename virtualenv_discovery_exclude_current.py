@@ -4,11 +4,12 @@ import logging
 import os
 
 from virtualenv.discovery.builtin import Builtin
-from virtualenv.discovery.builtin import check_path
+from virtualenv.discovery.builtin import fs_path_id
 from virtualenv.discovery.builtin import get_paths
+from virtualenv.discovery.builtin import IS_WIN
 from virtualenv.discovery.builtin import LazyPathDump
+from virtualenv.discovery.builtin import path_exe_finder
 from virtualenv.discovery.builtin import PathPythonInfo
-from virtualenv.discovery.builtin import possible_specs
 from virtualenv.discovery.py_info import PythonInfo
 from virtualenv.discovery.py_spec import PythonSpec
 
@@ -43,43 +44,67 @@ def get_interpreter(key, try_first_with, app_data=None, env=None):
 # Current interpreter is removed
 
 
-def propose_interpreters(spec, try_first_with, app_data, env=None):
+def propose_interpreters(  # noqa: C901, PLR0912, PLR0915
+    spec: PythonSpec,
+    try_first_with,
+    app_data=None,
+    env=None,
+):
     # 0. try with first
     env = os.environ if env is None else env
+    tested_exes: set[str] = set()
     for py_exe in try_first_with:
         path = os.path.abspath(py_exe)
         try:
-            # Windows Store Python does not work with os.path.exists, but does for os.lstat
-            os.lstat(path)
+            os.lstat(path)  # Windows Store Python does not work with os.path.exists, but does for os.lstat
         except OSError:
             pass
         else:
-            yield PythonInfo.from_exe(os.path.abspath(path), app_data, env=env), True
+            exe_raw = os.path.abspath(path)
+            exe_id = fs_path_id(exe_raw)
+            if exe_id in tested_exes:
+                continue
+            tested_exes.add(exe_id)
+            yield PythonInfo.from_exe(exe_raw, app_data, env=env), True
 
     # 1. if it's a path and exists
     if spec.path is not None:
         try:
-            # Windows Store Python does not work with os.path.exists, but does for os.lstat
-            os.lstat(spec.path)
+            os.lstat(spec.path)  # Windows Store Python does not work with os.path.exists, but does for os.lstat
         except OSError:
             if spec.is_abs:
                 raise
         else:
-            yield PythonInfo.from_exe(os.path.abspath(spec.path), app_data, env=env), True
+            exe_raw = os.path.abspath(spec.path)
+            exe_id = fs_path_id(exe_raw)
+            if exe_id not in tested_exes:
+                tested_exes.add(exe_id)
+                yield PythonInfo.from_exe(exe_raw, app_data, env=env), True
         if spec.is_abs:
             return
+    else:
+
+        # 3. otherwise fallback to platform default logic
+        if IS_WIN:
+            from .windows import propose_interpreters  # noqa: PLC0415
+
+            for interpreter in propose_interpreters(spec, app_data, env):
+                exe_raw = str(interpreter.executable)
+                exe_id = fs_path_id(exe_raw)
+                if exe_id in tested_exes:
+                    continue
+                tested_exes.add(exe_id)
+                yield interpreter, True
     # finally just find on path, the path order matters (as the candidates are less easy to control by end user)
-    paths = get_paths(env)
-    tested_exes = set()
-    for pos, path in enumerate(paths):
-        path_str = str(path)
-        logging.debug(LazyPathDump(pos, path_str, env))
-        for candidate, match in possible_specs(spec):
-            found = check_path(candidate, path_str)
-            if found is not None:
-                exe = os.path.abspath(found)
-                if exe not in tested_exes:
-                    tested_exes.add(exe)
-                    interpreter = PathPythonInfo.from_exe(exe, app_data, raise_on_error=False, env=env)
-                    if interpreter is not None:
-                        yield interpreter, match
+    find_candidates = path_exe_finder(spec)
+    for pos, path in enumerate(get_paths(env)):
+        logging.debug(LazyPathDump(pos, path, env))
+        for exe, impl_must_match in find_candidates(path):
+            exe_raw = str(exe)
+            exe_id = fs_path_id(exe_raw)
+            if exe_id in tested_exes:
+                continue
+            tested_exes.add(exe_id)
+            interpreter = PathPythonInfo.from_exe(exe_raw, app_data, raise_on_error=False, env=env)
+            if interpreter is not None:
+                yield interpreter, impl_must_match
